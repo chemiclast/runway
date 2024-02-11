@@ -30,7 +30,7 @@ png = "0.17.10"
 pretty_env_logger = "0.5.0"
 rbxcloud = "0.6.1"
 regex = "1.9.1"
-reqwest = "0.11.18"
+reqwest = { version = "0.11.18", features = ["gzip"] }
 secrecy = "0.8.0"
 serde = { version = "1.0.171", features = ["derive", "rc"] }
 thiserror = "1.0.43"
