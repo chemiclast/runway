@@ -652,24 +652,18 @@ async fn roblox_get_asset(
         })
         .await?;
 
-    // TODO: rbxcloud doesn't wrap AssetGetOperation.response in Option
-    // If/when https://github.com/Sleitnick/rbxcloud/pull/32 is merged,
-    // this code should handle errors properly
+    if let Some(r) = &response.response {
+        Ok(r.asset_id.clone())
+    } else {
+        let done = response.done.unwrap_or(false);
 
-    // if let Some(r) = &response.response {
-    //     Ok(r.asset_id.clone())
-    // } else {
-    //     let done = response.done.unwrap_or(false);
-
-    //     if !done {
-    //         Err(SyncError::UploadNotDone)
-    //     } else {
-    //         log::warn!("GetAsset {ident}: unexpected response: {:#?}", response);
-    //         Err(SyncError::UploadFailed)
-    //     }
-    // }
-
-    Ok(response.response.asset_id)
+        if !done {
+            Err(SyncError::UploadNotDone)
+        } else {
+            log::warn!("GetAsset {ident}: unexpected response: {:#?}", response);
+            Err(SyncError::UploadFailed)
+        }
+    }
 }
 async fn get_texture_with_retry(
     max_textureid_failures: usize,
