@@ -474,6 +474,8 @@ impl SyncStrategy for RobloxSyncStrategy {
 				// Apply preprocessing
 				preprocess(asset)?;
 
+                let mut name = ident.last_component();
+
 				// Loop until we've had too many errors
                 for create_idx in 0..max_create_failures {
                     // If we're retrying, wait a bit first
@@ -483,7 +485,7 @@ impl SyncStrategy for RobloxSyncStrategy {
 
                     log::debug!("CreateAsset {}: starting attempt {}", ident, create_idx + 1);
 
-                    match roblox_create_asset(self, ident, asset, create_ratelimit.clone()).await {
+                    match roblox_create_asset(self, ident, asset, name, create_ratelimit.clone()).await {
                         Ok(operation_id) => {
                             log::trace!("CreateAsset {ident}: returned operation {operation_id}");
 
@@ -572,6 +574,14 @@ impl SyncStrategy for RobloxSyncStrategy {
                             }
                         }
                         Err(e) => {
+                            if let SyncError::RbxCloud { source: rbxcloud::rbx::error::Error::HttpStatusError { code, ref msg } } = e {
+                                if code == 400 && msg.contains("Asset name and description is fully moderated.") {
+                                    log::warn!("CreateAsset {}: name moderated, retrying with generic name", ident);
+                                    name = "RunwayAsset";
+                                    continue;
+                                }
+                            }
+
                             log::error!("CreateAsset {}: error: {}", ident, e);
                         }
                     }
@@ -603,6 +613,7 @@ async fn roblox_create_asset(
     strategy: &RobloxSyncStrategy,
     ident: &AssetIdent,
     asset: &Asset,
+    name: &str,
     create_ratelimit: Arc<RateLimiter>,
 ) -> Result<String, SyncError> {
     create_ratelimit.wait().await;
@@ -614,7 +625,7 @@ async fn roblox_create_asset(
         .create(&CreateAsset {
             asset: AssetCreation {
                 asset_type: ident.asset_type(),
-                display_name: ident.last_component().to_string(),
+                display_name: name.to_string(),
                 description: "Uploaded by Runway.".to_string(),
                 creation_context: AssetCreationContext {
                     creator: strategy.creator.clone(),
