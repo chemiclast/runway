@@ -8,11 +8,13 @@ use std::{
 
 use arl::RateLimiter;
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::{stream::FuturesUnordered, StreamExt};
 use ignore::{
     overrides::{Override, OverrideBuilder},
     DirEntry, WalkBuilder,
 };
+use log::error;
 use once_cell::sync::Lazy;
 use rbxcloud::rbx::{
     assets::{
@@ -21,10 +23,14 @@ use rbxcloud::rbx::{
     },
     CreateAsset, GetAsset, RbxAssets, RbxCloud,
 };
+use reqwest::header::COOKIE;
+use reqwest::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tokio::time::Instant;
 
+use crate::cli::UploadOptions;
+use crate::config::UniverseConfig;
 use crate::{
     api::AssetDelivery,
     asset::Asset,
@@ -36,6 +42,46 @@ use crate::{
     state::{AssetState, State, StateError, TargetState},
     symlink::{symlink_content_folders, SymlinkError},
 };
+
+// Significant portions of the code dealing with audio permissions from https://github.com/UpliftGames/remodel
+// Copyright (c) 2020 Lucien Greathouse
+// License: MIT (https://mit-license.org/)
+
+const PERMS_URL: &str = "https://apis.roblox.com/asset-permissions-api/v1/assets/check-permissions";
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioPermissionsRequest {
+    requests: Vec<AudioPermissionsRequestEntry>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioPermissionsRequestEntry {
+    subject: AudioPermissionsRequestSubject,
+    action: String,
+    asset_id: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioPermissionsRequestSubject {
+    subject_type: String,
+    subject_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioPermissionsResponse {
+    results: Vec<AudioPermissionsResponseEntry>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AudioPermissionsResponseEntry {
+    Error { code: String, message: String },
+    Value { status: String },
+}
 
 struct SyncSession {
     config: Config,
@@ -86,12 +132,12 @@ pub async fn sync_with_config(
         }
         TargetType::Roblox => {
             let Some(api_key) = &options.upload.api_key else {
-				return Err(SyncError::MissingApiKey);
-			};
+                return Err(SyncError::MissingApiKey);
+            };
 
             let Some(creator) = &options.upload.creator else {
-				return Err(SyncError::MissingCreator);
-			};
+                return Err(SyncError::MissingCreator);
+            };
 
             let creator = if let Some(id) = &creator.user_id {
                 AssetCreator::User(AssetUserCreator {
@@ -105,7 +151,7 @@ pub async fn sync_with_config(
                 unreachable!();
             };
 
-            Box::new(RobloxSyncStrategy::new(api_key, creator))
+            Box::new(RobloxSyncStrategy::new(api_key, creator, &options.upload))
         }
     };
 
@@ -280,17 +326,17 @@ impl SyncSession {
                         log::trace!("Asset '{}' has a different hash, will sync", ident);
                         true
                     } else {
-						if *check_local_path {
-							if let Some(local_path) = &prev_state.local_path {
-								if !local_path.exists() {
-									log::trace!("Asset '{}' is unchanged but last known path does not exist, will sync", ident);
-									return true
-								}
-							} else {
-								log::trace!("Asset '{}' is unchanged but does not have last known path, will sync", ident);
-								return true
-							}
-						}
+                        if *check_local_path {
+                            if let Some(local_path) = &prev_state.local_path {
+                                if !local_path.exists() {
+                                    log::trace!("Asset '{}' is unchanged but last known path does not exist, will sync", ident);
+                                    return true;
+                                }
+                            } else {
+                                log::trace!("Asset '{}' is unchanged but does not have last known path, will sync", ident);
+                                return true;
+                            }
+                        }
 
                         log::trace!("Asset '{}' is unchanged, skipping", ident);
                         false
@@ -342,14 +388,17 @@ fn raise_error(error: impl Into<anyhow::Error>, errors: &mut Vec<anyhow::Error>)
 trait SyncStrategy: Send {
     async fn perform_sync(&self, session: &mut SyncSession) -> (usize, usize);
 }
+
 struct LocalSyncStrategy {
     local_path: PathBuf,
 }
+
 impl LocalSyncStrategy {
     fn new(local_path: PathBuf) -> Self {
         LocalSyncStrategy { local_path }
     }
 }
+
 #[async_trait]
 impl SyncStrategy for LocalSyncStrategy {
     async fn perform_sync(&self, session: &mut SyncSession) -> (usize, usize) {
@@ -426,9 +475,12 @@ struct RobloxSyncStrategy {
     assets: RbxAssets,
     creator: AssetCreator,
     asset_delivery: Lazy<AssetDelivery>,
+    cookie: Option<SecretString>,
+    force_permissions: bool,
 }
+
 impl RobloxSyncStrategy {
-    fn new(api_key: &SecretString, creator: AssetCreator) -> Self {
+    fn new(api_key: &SecretString, creator: AssetCreator, options: &UploadOptions) -> Self {
         let cloud = RbxCloud::new(api_key.expose_secret());
         let assets = cloud.assets();
         let asset_delivery: Lazy<AssetDelivery> = Lazy::new(AssetDelivery::new);
@@ -437,9 +489,15 @@ impl RobloxSyncStrategy {
             assets,
             creator,
             asset_delivery,
+            cookie: options
+                .auth_cookie
+                .clone()
+                .or(rbx_cookie::get_value().map(|value| SecretString::new(value))),
+            force_permissions: options.force_permissions,
         }
     }
 }
+
 #[async_trait]
 impl SyncStrategy for RobloxSyncStrategy {
     async fn perform_sync(&self, session: &mut SyncSession) -> (usize, usize) {
@@ -464,140 +522,151 @@ impl SyncStrategy for RobloxSyncStrategy {
             &session.target,
             &false,
         )
-        .map(|(ident, asset)| {
-            let create_ratelimit = create_ratelimit.clone();
-            let get_ratelimit = get_ratelimit.clone();
-            let target_key = target_key.clone();
+            .map(|(ident, asset)| {
+                let create_ratelimit = create_ratelimit.clone();
+                let get_ratelimit = get_ratelimit.clone();
+                let target_key = target_key.clone();
 
-            // Map the needs_sync iterator to a collection of futures
-            async move {
-				// Apply preprocessing
-				preprocess(asset)?;
+                // Map the needs_sync iterator to a collection of futures
+                async move {
+                    // Apply preprocessing
+                    preprocess(asset)?;
 
-                let mut name = ident.last_component();
+                    let mut name = ident.last_component();// Loop until we've had too many errors
+                    for create_idx in 0..max_create_failures {
+                        // If we're retrying, wait a bit first
+                        if create_idx > 0 {
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
 
-				// Loop until we've had too many errors
-                for create_idx in 0..max_create_failures {
-                    // If we're retrying, wait a bit first
-                    if create_idx > 0 {
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                    }
+                        log::debug!("CreateAsset {}: starting attempt {}", ident, create_idx + 1);
 
-                    log::debug!("CreateAsset {}: starting attempt {}", ident, create_idx + 1);
+                        match roblox_create_asset(self, ident, asset, name, create_ratelimit.clone()).await {
+                            Ok(operation_id) => {
+                                log::trace!("CreateAsset {ident}: returned operation {operation_id}");
 
-                    match roblox_create_asset(self, ident, asset, name, create_ratelimit.clone()).await {
-                        Ok(operation_id) => {
-                            log::trace!("CreateAsset {ident}: returned operation {operation_id}");
+                                let operation_id = Arc::new(operation_id);
 
-                            let operation_id = Arc::new(operation_id);
+                                let mut get_idx = 0;
+                                let mut get_failures = 0;
 
-                            let mut get_idx = 0;
-                            let mut get_failures = 0;
+                                // Loop until the asset finishes with an ID or we fail too much
+                                loop {
+                                    get_idx += 1;
 
-                            // Loop until the asset finishes with an ID or we fail too much
-                            loop {
-                                get_idx += 1;
+                                    let wait = 2_u64.pow(get_idx);
 
-                                let wait = 2_u64.pow(get_idx);
-
-                                log::debug!(
+                                    log::debug!(
                                     "GetAsset {}: starting attempt {} in {}s",
                                     ident,
                                     get_idx,
                                     wait,
                                 );
 
-                                tokio::time::sleep(Duration::from_secs(wait)).await;
+                                    tokio::time::sleep(Duration::from_secs(wait)).await;
 
-                                match roblox_get_asset(
-                                    self,
-                                    ident,
-                                    operation_id.clone(),
-                                    get_ratelimit.clone(),
-                                )
-                                .await
-                                {
-                                    Ok(asset_id) => {
-                                        let mut final_id = asset_id;
+                                    match roblox_get_asset(
+                                        self,
+                                        ident,
+                                        operation_id.clone(),
+                                        get_ratelimit.clone(),
+                                    )
+                                        .await
+                                    {
+                                        Ok(asset_id) => {
+                                            let mut final_id = asset_id;
 
-                                        if matches!(
+                                            if matches!(
                                             asset.ident.asset_type(),
                                             AssetType::DecalBmp
                                                 | AssetType::DecalPng
                                                 | AssetType::DecalJpeg
                                                 | AssetType::DecalTga
                                         ) {
-											log::debug!("Uploaded {} as rbxassetid://{}, mapping to texture ID", &ident, &final_id);
+                                                log::debug!("Uploaded {} as rbxassetid://{}, mapping to texture ID", &ident, &final_id);
 
-											let image_id = get_texture_with_retry(max_textureid_failures, &self.asset_delivery, &final_id).await?;
+                                                let image_id = get_texture_with_retry(max_textureid_failures, &self.asset_delivery, &final_id).await?;
 
-                                            final_id = image_id;
-                                        }
+                                                final_id = image_id;
+                                            }
 
-										log::info!(
+                                            log::info!(
                                             "Uploaded {} as rbxassetid://{}",
                                             ident,
                                             final_id
                                         );
 
-                                        asset.targets.insert(
-                                            target_key.to_string(),
-                                            TargetState {
-                                                hash: asset.hash.clone(),
-                                                id: format!("rbxassetid://{}", final_id),
-                                                local_path: None,
-                                            },
-                                        );
+                                            asset.targets.insert(
+                                                target_key.to_string(),
+                                                TargetState {
+                                                    hash: asset.hash.clone(),
+                                                    id: format!("rbxassetid://{}", &final_id),
+                                                    local_path: None,
+                                                },
+                                            );
 
-                                        return Ok(());
-                                    }
-                                    Err(e) => {
-                                        // Don't consider unfinished uploads to be errors
-                                        if matches!(e, SyncError::UploadNotDone) {
-                                            log::trace!("GetAsset {}: not done yet", ident);
-                                        } else {
-                                            log::error!("GetAsset {}: error: {}", ident, e);
+                                            if matches!(
+                                            asset.ident.asset_type(),
+                                            AssetType::AudioMp3
+                                                | AssetType::AudioOgg
+                                        ) {
+                                                return Ok(Some(final_id));
+                                            } else {
+                                                return Ok(None);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Don't consider unfinished uploads to be errors
+                                            if matches!(e, SyncError::UploadNotDone) {
+                                                log::trace!("GetAsset {}: not done yet", ident);
+                                            } else {
+                                                log::error!("GetAsset {}: error: {}", ident, e);
 
-                                            get_failures += 1;
+                                                get_failures += 1;
 
-                                            // API failed too many times, give up
-                                            if get_failures >= max_get_failures {
-                                                log::error!(
+                                                // API failed too many times, give up
+                                                if get_failures >= max_get_failures {
+                                                    log::error!(
                                                     "GetAsset {}: failed too many times",
                                                     ident
                                                 );
-                                                return Err(SyncError::UploadFailed);
+                                                    return Err(SyncError::UploadFailed);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            if let SyncError::RbxCloud { source: rbxcloud::rbx::error::Error::HttpStatusError { code, ref msg } } = e {
+                            Err(e) => {
+                                if let SyncError::RbxCloud { source: rbxcloud::rbx::error::Error::HttpStatusError { code, ref msg } } = e {
                                 if code == 400 && msg.contains("Asset name and description is fully moderated.") {
                                     log::warn!("CreateAsset {}: name moderated, retrying with generic name", ident);
                                     name = "RunwayAsset";
                                     continue;
                                 }
+                            }log::error!("CreateAsset {}: error: {}", ident, e);
                             }
-
-                            log::error!("CreateAsset {}: error: {}", ident, e);
                         }
                     }
-                }
 
-                log::error!("CreateAsset {}: failed too many times", &ident);
-                Err(SyncError::UploadFailed)
-            }
-        })
-        .collect();
+                    log::error!("CreateAsset {}: failed too many times", &ident);
+                    Err(SyncError::UploadFailed)
+                }
+            })
+            .collect();
+
+        let mut synced = vec![];
 
         // Wait for all futures to finish and log errors
         while let Some(result) = futures.next().await {
             match result {
-                Ok(()) => {
+                Ok(id) => {
                     ok_count += 1;
+                    if !self.force_permissions {
+                        if let Some(id) = id {
+                            synced.push(id)
+                        }
+                    }
                 }
                 Err(e) => {
                     raise_error(e, &mut session.errors);
@@ -606,9 +675,174 @@ impl SyncStrategy for RobloxSyncStrategy {
             }
         }
 
+        drop(futures); // free up session.assets
+
+        if self.force_permissions {
+            synced = session
+                .assets
+                .iter()
+                .filter(|(_, asset)| {
+                    matches!(
+                        asset.ident.asset_type(),
+                        AssetType::AudioOgg | AssetType::AudioMp3
+                    )
+                })
+                .filter_map(|(_, asset)| {
+                    asset
+                        .targets
+                        .get(&target_key.to_string())
+                        .map(|target| target.id.clone()) // TODO: try not to clone
+                })
+                .collect();
+        }
+
+        if !synced.is_empty() && !session.config.universes.is_empty() {
+            if let Some(cookie) = &self.cookie {
+                let mut request_futures: Vec<BoxFuture<'_, Result<_, SyncError>>> = Vec::new();
+                for UniverseConfig { id: universe_id } in &session.config.universes {
+                    for chunk in synced.chunks(50) {
+                        let request_data = serde_json::to_string(&chunk.iter().fold(
+                            AudioPermissionsRequest {
+                                requests: Vec::new(),
+                            },
+                            |mut base: AudioPermissionsRequest, asset_id| {
+                                base.requests.push(AudioPermissionsRequestEntry {
+                                    subject: AudioPermissionsRequestSubject {
+                                        subject_type: "Universe".into(),
+                                        subject_id: format!("{}", universe_id),
+                                    },
+                                    action: "Use".into(),
+                                    asset_id: format!("{}", asset_id),
+                                });
+                                base
+                            },
+                        ));
+
+                        if request_data.is_err() {
+                            log::warn!(
+                                "AudioPermissions (Universe {}): Failed to serialize request body",
+                                universe_id
+                            );
+                            continue;
+                        }
+
+                        let request_data = request_data.unwrap();
+
+                        request_futures.push(Box::pin(async move {
+                            let client = reqwest::Client::builder()
+                                .timeout(Duration::from_secs(60 * 3))
+                                .build()
+                                .map_err(|e| SyncError::Reqwest { source: e })?;
+
+                            let build_request = || {
+                                client
+                                    .post(PERMS_URL)
+                                    .header(
+                                        COOKIE,
+                                        format!(".ROBLOSECURITY={}", cookie.expose_secret()),
+                                    )
+                                    .header("Content-Type", "application/json")
+                                    .body(request_data.clone())
+                            };
+
+                            let mut response = build_request()
+                                .send()
+                                .await
+                                .map_err(|e| SyncError::Reqwest { source: e })?;
+
+                            if response.status() == StatusCode::FORBIDDEN {
+                                if let Some(csrf_token) = response.headers().get("X-CSRF-Token") {
+                                    log::debug!("Received CSRF challenge, retrying with token...");
+                                    response = build_request()
+                                        .header("X-CSRF-Token", csrf_token)
+                                        .send()
+                                        .await
+                                        .map_err(|e| SyncError::Reqwest { source: e })?;
+                                }
+                            };
+
+                            let response = response
+                                .error_for_status()
+                                .map_err(|e| SyncError::Reqwest { source: e })?;
+
+                            let response_data: AudioPermissionsResponse = response
+                                .json()
+                                .await
+                                .map_err(|e| SyncError::Reqwest { source: e })?;
+
+                            Ok(response_data
+                                .results
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, result)| {
+                                    let asset_id = format!("{}", chunk[index]);
+                                    match result {
+                                        AudioPermissionsResponseEntry::Value { status } => {
+                                            (asset_id, Ok(status == "HasPermission"))
+                                        }
+                                        AudioPermissionsResponseEntry::Error { code, message } => {
+                                            (asset_id, Err(format!("{} {}", code, message)))
+                                        }
+                                    }
+                                })
+                                .collect::<HashMap<String, Result<bool, String>>>())
+                        }));
+                    }
+                }
+
+                let results = futures::future::join_all(request_futures).await;
+                let mut successes = 0;
+
+                for (UniverseConfig { id: universe_id }, results) in session
+                    .config
+                    .universes
+                    .iter()
+                    .zip(results.chunks(synced.len().div_ceil(50)))
+                {
+                    for (chunk_id, result) in results.iter().enumerate() {
+                        match result {
+                            Ok(result) => {
+                                for (asset_id, result) in result {
+                                    match result {
+                                        Ok(has_permission) => {
+                                            if !has_permission {
+                                                log::warn!("AudioPermissions (Universe {}): Failed to update permissions for rbxassetid://{}", universe_id, asset_id)
+                                            } else {
+                                                successes += 1;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            log::warn!("AudioPermissions (Universe {}): Error occurred while updating permissions for rbxassetid://{}: {}", universe_id, asset_id, error)
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let ids =
+                                    &synced[50 * chunk_id..(50 * (chunk_id + 1)).min(synced.len())];
+                                // TODO: Currently, all requests to the API return 400 Bad Request and switch to this branch? Investigate
+                                log::warn!("AudioPermissions (Universe {}): Failed to update permissions for chunk #{} containing {} ID(s) [{}]: {}", universe_id, chunk_id + 1, ids.len(), ids.iter().map(|id| format!("rbxassetid://{}", id)).collect::<Vec<_>>().join(", "), e)
+                            }
+                        };
+                    }
+                }
+
+                if successes > 0 {
+                    log::info!(
+                        "AudioPermissions: Successfully updated {} permission(s) in {} universe(s).",
+                        successes,
+                        &session.config.universes.len()
+                    )
+                }
+            } else {
+                log::warn!("AudioPermissions: Cannot modify audio permissions without a .ROBLOSECURITY cookie. Either indicated that permissions are unneeded by removing all universe keys in your runway.toml or provide a cookie through the --cookie argument. Skipping step...")
+            }
+        }
+
         (ok_count, err_count)
     }
 }
+
 async fn roblox_create_asset(
     strategy: &RobloxSyncStrategy,
     ident: &AssetIdent,
@@ -646,6 +880,7 @@ async fn roblox_create_asset(
 
     Ok(operation_id)
 }
+
 async fn roblox_get_asset(
     strategy: &RobloxSyncStrategy,
     ident: &AssetIdent,
@@ -676,6 +911,7 @@ async fn roblox_get_asset(
         }
     }
 }
+
 async fn get_texture_with_retry(
     max_textureid_failures: usize,
     asset_delivery: &AssetDelivery,
@@ -764,4 +1000,10 @@ pub enum SyncError {
 
     #[error("Roblox API error")]
     RobloxApi,
+
+    #[error(transparent)]
+    Reqwest {
+        #[from]
+        source: reqwest::Error,
+    },
 }

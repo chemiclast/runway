@@ -30,6 +30,10 @@ pub struct Config {
     #[serde(default, rename = "codegen")]
     pub codegens: Vec<CodegenConfig>,
 
+    /// A list of universes to give audio permissions to.
+    #[serde(default, rename = "universe")]
+    pub universes: Vec<UniverseConfig>,
+
     /// The path that this config came from. Paths in this config
     /// should be relative to the folder containing the config file.
     #[serde(skip)]
@@ -114,6 +118,13 @@ pub struct CodegenConfig {
     /// Flattens the output.
     #[serde(default)]
     pub flatten: bool,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct UniverseConfig {
+    /// The ID of the universe to give audio permissions to.
+    pub id: u64,
 }
 
 fn default_strip_extension() -> bool {

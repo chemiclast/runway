@@ -72,6 +72,13 @@ pub struct UploadOptions {
     #[arg(short, long, env = "RUNWAY_API_KEY")]
     pub api_key: Option<SecretString>,
 
+    #[arg(long, env = "RUNWAY_AUTH_COOKIE")]
+    pub auth_cookie: Option<SecretString>,
+
+    /// (Roblox targets only) Forces audio permission updates for all sound assets.
+    #[arg(short = 'p', long)]
+    pub force_permissions: bool,
+
     #[command(flatten)]
     pub creator: Option<Creator>,
 }
