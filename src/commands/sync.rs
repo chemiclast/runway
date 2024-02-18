@@ -685,91 +685,89 @@ impl SyncStrategy for RobloxSyncStrategy {
         if !synced.is_empty() && !session.config.universes.is_empty() {
             if let Some(cookie) = &self.cookie {
                 let mut request_futures: Vec<BoxFuture<'_, Result<_, SyncError>>> = Vec::new();
-                for UniverseConfig { id: universe_id } in &session.config.universes {
-                    for asset_id in &synced {
-                        let request_data = serde_json::to_string(&AudioPermissionsRequest {
-                            requests: vec![AudioPermissionsRequestEntry {
-                                subject_type: "Universe".into(),
-                                subject_id: format!("{}", universe_id),
-                                action: "Use".into(),
-                            }],
-                        });
-
-                        if request_data.is_err() {
-                            log::warn!(
-                                "AudioPermissions (Universe {}): Failed to serialize request body",
-                                universe_id
-                            );
-                            continue;
-                        }
-
-                        let request_data = request_data.unwrap();
-
-                        let asset_id = asset_id.matches(char::is_numeric).collect::<String>(); // original asset id is in the form "rbxassetid://<ID>"
-
-                        request_futures.push(Box::pin(async move {
-                            let client = reqwest::Client::builder()
-                                .timeout(Duration::from_secs(60 * 3))
-                                .build()
-                                .map_err(|e| SyncError::Reqwest { source: e })?;
-
-                            let build_request = || {
-                                client
-                                    .patch(format!("https://apis.roblox.com/asset-permissions-api/v1/assets/{}/permissions", asset_id))
-                                    .header(
-                                        COOKIE,
-                                        format!(".ROBLOSECURITY={}", cookie.expose_secret()),
-                                    )
-                                    .header("Content-Type", "application/json-patch+json")
-                                    .body(request_data.clone())
-                            };
-
-                            let mut response = build_request()
-                                .send()
-                                .await
-                                .map_err(|e| SyncError::Reqwest { source: e })?;
-
-                            if response.status() == StatusCode::FORBIDDEN {
-                                if let Some(csrf_token) = response.headers().get("X-CSRF-Token") {
-                                    log::debug!("Received CSRF challenge, retrying with token...");
-                                    response = build_request()
-                                        .header("X-CSRF-Token", csrf_token)
-                                        .send()
-                                        .await
-                                        .map_err(|e| SyncError::Reqwest { source: e })?;
+                for asset_id in &synced {
+                    let request_data = serde_json::to_string(&AudioPermissionsRequest {
+                        requests: session
+                            .config
+                            .universes
+                            .iter()
+                            .map(|UniverseConfig { id: universe_id }| {
+                                AudioPermissionsRequestEntry {
+                                    subject_type: "Universe".into(),
+                                    subject_id: format!("{}", universe_id),
+                                    action: "Use".into(),
                                 }
-                            };
+                            })
+                            .collect(),
+                    });
 
-                            let response = response
-                                .error_for_status()
-                                .map_err(|e| SyncError::Reqwest { source: e })?;
-
-                            Ok(())
-                        }));
+                    if request_data.is_err() {
+                        log::warn!(
+                            "AudioPermissions (Asset {}): Failed to serialize request body",
+                            asset_id
+                        );
+                        continue;
                     }
+
+                    let request_data = request_data.unwrap();
+
+                    let asset_id = asset_id.matches(char::is_numeric).collect::<String>(); // original asset id is in the form "rbxassetid://<ID>"
+
+                    request_futures.push(Box::pin(async move {
+                        let client = reqwest::Client::builder()
+                            .timeout(Duration::from_secs(60 * 3))
+                            .build()
+                            .map_err(|e| SyncError::Reqwest { source: e })?;
+
+                        let build_request = || {
+                            client
+                                .patch(format!("https://apis.roblox.com/asset-permissions-api/v1/assets/{}/permissions", asset_id))
+                                .header(
+                                    COOKIE,
+                                    format!(".ROBLOSECURITY={}", cookie.expose_secret()),
+                                )
+                                .header("Content-Type", "application/json-patch+json")
+                                .body(request_data.clone())
+                        };
+
+                        let mut response = build_request()
+                            .send()
+                            .await
+                            .map_err(|e| SyncError::Reqwest { source: e })?;
+
+                        if response.status() == StatusCode::FORBIDDEN {
+                            if let Some(csrf_token) = response.headers().get("X-CSRF-Token") {
+                                log::debug!("Received CSRF challenge, retrying with token...");
+                                response = build_request()
+                                    .header("X-CSRF-Token", csrf_token)
+                                    .send()
+                                    .await
+                                    .map_err(|e| SyncError::Reqwest { source: e })?;
+                            }
+                        };
+
+                        let response = response
+                            .error_for_status()
+                            .map_err(|e| SyncError::Reqwest { source: e })?;
+
+                        Ok(())
+                    }));
                 }
 
                 let results = futures::future::join_all(request_futures).await;
                 let mut successes = 0;
-
-                for (UniverseConfig { id: universe_id }, results) in session
-                    .config
-                    .universes
-                    .iter()
-                    .zip(results.chunks(results.len().div_ceil(session.config.universes.len())))
-                {
-                    for (index, result) in results.iter().enumerate() {
-                        let asset_id = &synced[index % synced.len()];
-                        match result {
-                            Ok(_) => {
-                                successes += 1;
-                            }
-                            Err(error) => {
-                                log::warn!("AudioPermissions (Universe {}): Error occurred while updating permissions for rbxassetid://{}: {}", universe_id, asset_id, error)
-                            }
-                        };
-                    }
+                for (index, result) in results.iter().enumerate() {
+                    let asset_id = &synced[index % synced.len()];
+                    match result {
+                        Ok(..) => {
+                            successes += 1;
+                        }
+                        Err(error) => {
+                            log::warn!("AudioPermissions: Error occurred while updating permissions for rbxassetid://{}: {}", asset_id, error)
+                        }
+                    };
                 }
+
                 if successes > 0 {
                     log::info!(
                         "AudioPermissions: Successfully updated {} permission(s) in {} universe(s).",
