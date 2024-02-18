@@ -47,8 +47,6 @@ use crate::{
 // Copyright (c) 2020 Lucien Greathouse
 // License: MIT (https://mit-license.org/)
 
-const PERMS_URL: &str = "https://apis.roblox.com/asset-permissions-api/v1/assets/check-permissions";
-
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AudioPermissionsRequest {
@@ -58,22 +56,9 @@ struct AudioPermissionsRequest {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AudioPermissionsRequestEntry {
-    subject: AudioPermissionsRequestSubject,
     action: String,
-    asset_id: String,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AudioPermissionsRequestSubject {
     subject_type: String,
     subject_id: String,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AudioPermissionsResponse {
-    results: Vec<AudioPermissionsResponseEntry>,
 }
 
 #[derive(serde::Deserialize)]
@@ -639,12 +624,13 @@ impl SyncStrategy for RobloxSyncStrategy {
                             }
                             Err(e) => {
                                 if let SyncError::RbxCloud { source: rbxcloud::rbx::error::Error::HttpStatusError { code, ref msg } } = e {
-                                if code == 400 && msg.contains("Asset name and description is fully moderated.") {
-                                    log::warn!("CreateAsset {}: name moderated, retrying with generic name", ident);
-                                    name = "RunwayAsset";
-                                    continue;
+                                    if code == 400 && msg.contains("Asset name and description is fully moderated.") {
+                                        log::warn!("CreateAsset {}: name moderated, retrying with generic name", ident);
+                                        name = "RunwayAsset";
+                                        continue;
+                                    }
                                 }
-                            }log::error!("CreateAsset {}: error: {}", ident, e);
+                                log::error!("CreateAsset {}: error: {}", ident, e);
                             }
                         }
                     }
@@ -700,23 +686,14 @@ impl SyncStrategy for RobloxSyncStrategy {
             if let Some(cookie) = &self.cookie {
                 let mut request_futures: Vec<BoxFuture<'_, Result<_, SyncError>>> = Vec::new();
                 for UniverseConfig { id: universe_id } in &session.config.universes {
-                    for chunk in synced.chunks(50) {
-                        let request_data = serde_json::to_string(&chunk.iter().fold(
-                            AudioPermissionsRequest {
-                                requests: Vec::new(),
-                            },
-                            |mut base: AudioPermissionsRequest, asset_id| {
-                                base.requests.push(AudioPermissionsRequestEntry {
-                                    subject: AudioPermissionsRequestSubject {
-                                        subject_type: "Universe".into(),
-                                        subject_id: format!("{}", universe_id),
-                                    },
-                                    action: "Use".into(),
-                                    asset_id: format!("{}", asset_id),
-                                });
-                                base
-                            },
-                        ));
+                    for asset_id in &synced {
+                        let request_data = serde_json::to_string(&AudioPermissionsRequest {
+                            requests: vec![AudioPermissionsRequestEntry {
+                                subject_type: "Universe".into(),
+                                subject_id: format!("{}", universe_id),
+                                action: "Use".into(),
+                            }],
+                        });
 
                         if request_data.is_err() {
                             log::warn!(
@@ -728,6 +705,8 @@ impl SyncStrategy for RobloxSyncStrategy {
 
                         let request_data = request_data.unwrap();
 
+                        let asset_id = asset_id.matches(char::is_numeric).collect::<String>(); // original asset id is in the form "rbxassetid://<ID>"
+
                         request_futures.push(Box::pin(async move {
                             let client = reqwest::Client::builder()
                                 .timeout(Duration::from_secs(60 * 3))
@@ -736,12 +715,12 @@ impl SyncStrategy for RobloxSyncStrategy {
 
                             let build_request = || {
                                 client
-                                    .post(PERMS_URL)
+                                    .patch(format!("https://apis.roblox.com/asset-permissions-api/v1/assets/{}/permissions", asset_id))
                                     .header(
                                         COOKIE,
                                         format!(".ROBLOSECURITY={}", cookie.expose_secret()),
                                     )
-                                    .header("Content-Type", "application/json")
+                                    .header("Content-Type", "application/json-patch+json")
                                     .body(request_data.clone())
                             };
 
@@ -765,27 +744,7 @@ impl SyncStrategy for RobloxSyncStrategy {
                                 .error_for_status()
                                 .map_err(|e| SyncError::Reqwest { source: e })?;
 
-                            let response_data: AudioPermissionsResponse = response
-                                .json()
-                                .await
-                                .map_err(|e| SyncError::Reqwest { source: e })?;
-
-                            Ok(response_data
-                                .results
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, result)| {
-                                    let asset_id = format!("{}", chunk[index]);
-                                    match result {
-                                        AudioPermissionsResponseEntry::Value { status } => {
-                                            (asset_id, Ok(status == "HasPermission"))
-                                        }
-                                        AudioPermissionsResponseEntry::Error { code, message } => {
-                                            (asset_id, Err(format!("{} {}", code, message)))
-                                        }
-                                    }
-                                })
-                                .collect::<HashMap<String, Result<bool, String>>>())
+                            Ok(())
                         }));
                     }
                 }
@@ -797,36 +756,20 @@ impl SyncStrategy for RobloxSyncStrategy {
                     .config
                     .universes
                     .iter()
-                    .zip(results.chunks(synced.len().div_ceil(50)))
+                    .zip(results.chunks(results.len().div_ceil(session.config.universes.len())))
                 {
-                    for (chunk_id, result) in results.iter().enumerate() {
+                    for (index, result) in results.iter().enumerate() {
+                        let asset_id = &synced[index % synced.len()];
                         match result {
-                            Ok(result) => {
-                                for (asset_id, result) in result {
-                                    match result {
-                                        Ok(has_permission) => {
-                                            if !has_permission {
-                                                log::warn!("AudioPermissions (Universe {}): Failed to update permissions for rbxassetid://{}", universe_id, asset_id)
-                                            } else {
-                                                successes += 1;
-                                            }
-                                        }
-                                        Err(error) => {
-                                            log::warn!("AudioPermissions (Universe {}): Error occurred while updating permissions for rbxassetid://{}: {}", universe_id, asset_id, error)
-                                        }
-                                    }
-                                }
+                            Ok(_) => {
+                                successes += 1;
                             }
-                            Err(e) => {
-                                let ids =
-                                    &synced[50 * chunk_id..(50 * (chunk_id + 1)).min(synced.len())];
-                                // TODO: Currently, all requests to the API return 400 Bad Request and switch to this branch? Investigate
-                                log::warn!("AudioPermissions (Universe {}): Failed to update permissions for chunk #{} containing {} ID(s) [{}]: {}", universe_id, chunk_id + 1, ids.len(), ids.iter().map(|id| format!("rbxassetid://{}", id)).collect::<Vec<_>>().join(", "), e)
+                            Err(error) => {
+                                log::warn!("AudioPermissions (Universe {}): Error occurred while updating permissions for rbxassetid://{}: {}", universe_id, asset_id, error)
                             }
                         };
                     }
                 }
-
                 if successes > 0 {
                     log::info!(
                         "AudioPermissions: Successfully updated {} permission(s) in {} universe(s).",
