@@ -10,6 +10,7 @@ use arl::RateLimiter;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::{stream::FuturesUnordered, StreamExt};
+use futures_retry::{FutureRetry, RetryPolicy};
 use ignore::{
     overrides::{Override, OverrideBuilder},
     DirEntry, WalkBuilder,
@@ -47,7 +48,9 @@ use crate::{
 // Copyright (c) 2020 Lucien Greathouse
 // License: MIT (https://mit-license.org/)
 
-const PERMS_URL: &str = "https://apis.roblox.com/asset-permissions-api/v1/assets/check-permissions";
+const CHECK_PERMS_URL: &str =
+    "https://apis.roblox.com/asset-permissions-api/v1/assets/check-permissions";
+const MAXIMUM_PERM_GRANT_DURATION: Duration = Duration::from_secs(60 * 5);
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -387,6 +390,20 @@ fn raise_error(error: impl Into<anyhow::Error>, errors: &mut Vec<anyhow::Error>)
 #[async_trait]
 trait SyncStrategy: Send {
     async fn perform_sync(&self, session: &mut SyncSession) -> (usize, usize);
+    async fn grant_permissions(
+        &self,
+        universe_id: u64,
+        asset_id: &String,
+    ) -> Result<(), SyncError> {
+        unimplemented!();
+    }
+    async fn check_permissions(
+        &self,
+        universe_id: u64,
+        chunk: &[String],
+    ) -> Result<HashMap<String, Result<bool, String>>, SyncError> {
+        unimplemented!();
+    }
 }
 
 struct LocalSyncStrategy {
@@ -500,6 +517,151 @@ impl RobloxSyncStrategy {
 
 #[async_trait]
 impl SyncStrategy for RobloxSyncStrategy {
+    async fn check_permissions(
+        &self,
+        universe_id: u64,
+        chunk: &[String],
+    ) -> Result<HashMap<String, Result<bool, String>>, SyncError> {
+        let request_data = serde_json::to_string(&chunk.iter().fold(
+            AudioPermissionsRequest {
+                requests: Vec::new(),
+            },
+            |mut base: AudioPermissionsRequest, asset_id| {
+                base.requests.push(AudioPermissionsRequestEntry {
+                    subject: AudioPermissionsRequestSubject {
+                        subject_type: "Universe".into(),
+                        subject_id: format!("{}", universe_id),
+                    },
+                    action: "Use".into(),
+                    asset_id: format!("{}", asset_id.matches(char::is_numeric).collect::<String>()),
+                });
+                base
+            },
+        ));
+
+        if request_data.is_err() {
+            log::warn!(
+                "AudioPermissions (Universe {}): Failed to serialize request body",
+                universe_id
+            );
+            return Err(SyncError::Serde {
+                source: request_data.unwrap_err(),
+            });
+        }
+
+        let request_data = request_data.unwrap();
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60 * 3))
+            .build()
+            .map_err(|e| SyncError::Reqwest { source: e })?;
+
+        let build_request = || {
+            client
+                    .post(CHECK_PERMS_URL)
+                    .header(
+                        COOKIE,
+                        format!(".ROBLOSECURITY={}", self.cookie.as_ref().unwrap().expose_secret()), // Safe to unwrap because cookie presence should be checked before calling this method
+                    )
+                    .header("Content-Type", "application/json")
+                    .header(
+                        USER_AGENT,
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                    )
+                    .body(request_data.clone())
+        };
+
+        let mut response = build_request()
+            .send()
+            .await
+            .map_err(|e| SyncError::Reqwest { source: e })?;
+
+        if response.status() == StatusCode::FORBIDDEN {
+            if let Some(csrf_token) = response.headers().get("X-CSRF-Token") {
+                log::debug!("Received CSRF challenge, retrying with token...");
+                response = build_request()
+                    .header("X-CSRF-Token", csrf_token)
+                    .send()
+                    .await
+                    .map_err(|e| SyncError::Reqwest { source: e })?;
+            }
+        };
+
+        let response = response
+            .error_for_status()
+            .map_err(|e| SyncError::Reqwest { source: e })?;
+
+        let response_data: AudioPermissionsResponse = response
+            .json()
+            .await
+            .map_err(|e| SyncError::Reqwest { source: e })?;
+
+        Ok(response_data
+            .results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                let asset_id = format!("{}", chunk[index]);
+                match result {
+                    AudioPermissionsResponseEntry::Value { status } => {
+                        (asset_id, Ok(status == "HasPermission"))
+                    }
+                    AudioPermissionsResponseEntry::Error { code, message } => {
+                        (asset_id, Err(format!("{} {}", code, message)))
+                    }
+                }
+            })
+            .collect::<HashMap<String, Result<bool, String>>>())
+    }
+
+    async fn grant_permissions(
+        &self,
+        universe_id: u64,
+        asset_id: &String,
+    ) -> Result<(), SyncError> {
+        let url = format!(
+            "https://apis.roblox.com/asset-permissions-api/v1/assets/{}/permissions",
+            asset_id.matches(char::is_numeric).collect::<String>()
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60 * 3))
+            .build()
+            .map_err(|e| SyncError::Reqwest { source: e })?;
+
+        let build_request = move || {
+            client
+            .patch(&url)
+            .header(COOKIE, format!(".ROBLOSECURITY={}", self.cookie.as_ref().unwrap().expose_secret())) // Safe to unwrap because cookie presence should be checked before calling this method
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{"requests":[{{"subjectType":"Universe","subjectId":"{}","action":"Use"}}]}}"#,
+                universe_id
+            ))
+        };
+
+        let mut response = build_request()
+            .send()
+            .await
+            .map_err(|e| SyncError::Reqwest { source: e })?;
+
+        if response.status() == StatusCode::FORBIDDEN {
+            if let Some(csrf_token) = response.headers().get("X-CSRF-Token") {
+                log::debug!("Received CSRF challenge, retrying with token...");
+                response = build_request()
+                    .header("X-CSRF-Token", csrf_token)
+                    .send()
+                    .await
+                    .map_err(|e| SyncError::Reqwest { source: e })?;
+            }
+        };
+
+        let result = response
+            .error_for_status()
+            .map_err(|e| SyncError::Reqwest { source: e });
+
+        result.map(|_| ())
+    }
+
     async fn perform_sync(&self, session: &mut SyncSession) -> (usize, usize) {
         let target_key = Arc::new(session.target.key.clone());
 
@@ -698,105 +860,16 @@ impl SyncStrategy for RobloxSyncStrategy {
         }
 
         if !synced.is_empty() && !session.config.universes.is_empty() {
-            if let Some(cookie) = &self.cookie {
-                let mut request_futures: Vec<BoxFuture<'_, Result<_, SyncError>>> = Vec::new();
+            if (&self.cookie).is_some() {
+                let mut check_futures: Vec<BoxFuture<'_, Result<_, SyncError>>> = Vec::new();
                 for UniverseConfig { id: universe_id } in &session.config.universes {
                     for chunk in synced.chunks(50) {
-                        let request_data = serde_json::to_string(&chunk.iter().fold(
-                            AudioPermissionsRequest {
-                                requests: Vec::new(),
-                            },
-                            |mut base: AudioPermissionsRequest, asset_id| {
-                                base.requests.push(AudioPermissionsRequestEntry {
-                                    subject: AudioPermissionsRequestSubject {
-                                        subject_type: "Universe".into(),
-                                        subject_id: format!("{}", universe_id),
-                                    },
-                                    action: "Use".into(),
-                                    asset_id: format!("{}", asset_id.matches(char::is_numeric).collect::<String>()),
-                                });
-                                base
-                            },
-                        ));
-
-                        if request_data.is_err() {
-                            log::warn!(
-                                "AudioPermissions (Universe {}): Failed to serialize request body",
-                                universe_id
-                            );
-                            continue;
-                        }
-
-                        let request_data = request_data.unwrap();
-
-                        request_futures.push(Box::pin(async move {
-                            let client = reqwest::Client::builder()
-                                .timeout(Duration::from_secs(60 * 3))
-                                .build()
-                                .map_err(|e| SyncError::Reqwest { source: e })?;
-
-                            let build_request = || {
-                                client
-                                    .post(PERMS_URL)
-                                    .header(
-                                        COOKIE,
-                                        format!(".ROBLOSECURITY={}", cookie.expose_secret()),
-                                    )
-                                    .header("Content-Type", "application/json")
-                                    .header(
-                                        USER_AGENT,
-                                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                                    )
-                                    .body(request_data.clone())
-                            };
-
-                            let mut response = build_request()
-                                .send()
-                                .await
-                                .map_err(|e| SyncError::Reqwest { source: e })?;
-
-                            if response.status() == StatusCode::FORBIDDEN {
-                                if let Some(csrf_token) = response.headers().get("X-CSRF-Token") {
-                                    log::debug!("Received CSRF challenge, retrying with token...");
-                                    response = build_request()
-                                        .header("X-CSRF-Token", csrf_token)
-                                        .send()
-                                        .await
-                                        .map_err(|e| SyncError::Reqwest { source: e })?;
-                                }
-                            };
-
-                            let response = response
-                                .error_for_status()
-                                .map_err(|e| SyncError::Reqwest { source: e })?;
-
-                            let response_data: AudioPermissionsResponse = response
-                                .json()
-                                .await
-                                .map_err(|e| SyncError::Reqwest { source: e })?;
-
-                            Ok(response_data
-                                .results
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, result)| {
-                                    let asset_id = format!("{}", chunk[index]);
-                                    match result {
-                                        AudioPermissionsResponseEntry::Value { status } => {
-                                            (asset_id, Ok(status == "HasPermission"))
-                                        }
-                                        AudioPermissionsResponseEntry::Error { code, message } => {
-                                            (asset_id, Err(format!("{} {}", code, message)))
-                                        }
-                                    }
-                                })
-                                .collect::<HashMap<String, Result<bool, String>>>())
-                        }));
+                        check_futures.push(Box::pin(self.check_permissions(*universe_id, chunk)));
                     }
                 }
 
-                let results = futures::future::join_all(request_futures).await;
-                let mut successes = 0;
+                let results = futures::future::join_all(check_futures).await;
+                let mut to_grant: Vec<(&String, u64)> = Vec::new();
 
                 for (UniverseConfig { id: universe_id }, results) in session
                     .config
@@ -811,13 +884,12 @@ impl SyncStrategy for RobloxSyncStrategy {
                                     match result {
                                         Ok(has_permission) => {
                                             if !has_permission {
-                                                log::warn!("AudioPermissions (Universe {}): Failed to update permissions for {}", universe_id, asset_id)
-                                            } else {
-                                                successes += 1;
+                                                to_grant.push((asset_id, *universe_id));
                                             }
                                         }
                                         Err(error) => {
-                                            log::warn!("AudioPermissions (Universe {}): Error occurred while updating permissions for {}: {}", universe_id, asset_id, error)
+                                            to_grant.push((asset_id, *universe_id));
+                                            log::warn!("AudioPermissions (Universe {}): Error occurred while checking permissions for {}: {}", universe_id, asset_id, error)
                                         }
                                     }
                                 }
@@ -825,17 +897,80 @@ impl SyncStrategy for RobloxSyncStrategy {
                             Err(e) => {
                                 let ids =
                                     &synced[50 * chunk_id..(50 * (chunk_id + 1)).min(synced.len())];
-                                log::warn!("AudioPermissions (Universe {}): Failed to update permissions for chunk #{} containing {} ID(s) [{}]: {}", universe_id, chunk_id + 1, ids.len(), ids.join(", "), e)
+                                log::warn!("AudioPermissions (Universe {}): Failed to check permissions for chunk #{} containing {} ID(s) [{}]: {}", universe_id, chunk_id + 1, ids.len(), ids.join(", "), e)
                             }
                         };
                     }
                 }
 
-                if successes > 0 {
+                let start_time = Instant::now();
+
+                let grant_futures: Vec<_> = to_grant
+                    .iter()
+                    .map(|(asset_id, universe_id)| {
+                        FutureRetry::new(
+                            move || self.grant_permissions(*universe_id, asset_id),
+                            move |e: SyncError| {
+                                if start_time.elapsed() > MAXIMUM_PERM_GRANT_DURATION {
+                                    return RetryPolicy::ForwardError(e);
+                                }
+                                match e {
+                                    SyncError::RobloxApi {content: _ } | SyncError::Reqwest { source: _ } => {
+                                        log::warn!(
+                                            "AudioPermissions (Universe {}): Failed to grant permission for {}: {}",
+                                            universe_id,
+                                            asset_id,
+                                            e
+                                        );
+                                        RetryPolicy::WaitRetry(Duration::from_secs(15))
+                                    }
+                                    _ => RetryPolicy::ForwardError(e),
+                                }
+                            },
+                        )
+                    })
+                    .collect();
+
+                let results: Vec<Result<_, _>> = futures::future::join_all(grant_futures).await;
+
+                let (granted, denied): (Vec<_>, Vec<_>) = results
+                    .into_iter()
+                    .enumerate()
+                    .partition(|(_, result)| result.is_ok());
+
+                if granted.len() > 0 {
                     log::info!(
                         "AudioPermissions: Successfully updated {} permission(s) in {} universe(s).",
-                        successes,
+                        granted.len(),
                         &session.config.universes.len()
+                    )
+                }
+
+                if denied.len() > 0 {
+                    log::warn!(
+                        "AudioPermissions: Failed to update permissions for {}.",
+                        session
+                            .config
+                            .universes
+                            .iter()
+                            .map(|universe| format!(
+                                "Universe {}: {}",
+                                universe.id,
+                                denied
+                                    .iter()
+                                    .filter_map(|(index, _)| {
+                                        let (asset_id, universe_id) = &to_grant[*index];
+                                        if universe_id == &universe.id {
+                                            Some((*asset_id).clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect::<Vec<String>>()
+                                    .join(", ")
+                            ))
+                            .collect::<Vec<String>>()
+                            .join(", ")
                     )
                 }
             } else {
@@ -874,7 +1009,9 @@ async fn roblox_create_asset(
         })
         .await?;
 
-    let operation_path = result.path.ok_or_else(|| SyncError::RobloxApi)?;
+    let operation_path = result.path.ok_or_else(|| SyncError::RobloxApi {
+        content: "Failed to get asset path".to_string(),
+    })?;
 
     let operation_id = operation_path
         .strip_prefix("operations/")
@@ -930,7 +1067,9 @@ async fn get_texture_with_retry(
         }
     }
     // Failed all attempts
-    Err(SyncError::RobloxApi)
+    Err(SyncError::RobloxApi {
+        content: "Failed to map decal ID to texture ID".to_string(),
+    })
 }
 
 fn generate_asset_hash(content: &[u8]) -> String {
@@ -1002,12 +1141,18 @@ pub enum SyncError {
         source: rbxcloud::rbx::error::Error,
     },
 
-    #[error("Roblox API error")]
-    RobloxApi,
+    #[error("Roblox API error: {}", .content)]
+    RobloxApi { content: String },
 
     #[error(transparent)]
     Reqwest {
         #[from]
         source: reqwest::Error,
+    },
+
+    #[error(transparent)]
+    Serde {
+        #[from]
+        source: serde_json::Error,
     },
 }
